@@ -19,6 +19,7 @@
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/kernel/xthread.h"
 #include "xenia/xbox.h"
+#include <random>
 
 DECLARE_int32(user_language);
 
@@ -97,10 +98,12 @@ X_HRESULT_result_t XamUserGetSigninInfo_entry(
 
   if (kernel_state()->IsUserSignedIn(user_index)) {
     const auto& user_profile = kernel_state()->user_profile(user_index);
-    info->xuid = user_profile->xuid();
     info->signin_state = user_profile->signin_state();
     xe::string_util::copy_truncating(info->name, user_profile->name(),
                                      xe::countof(info->name));
+    info->xuid = user_profile->xuid();
+    // This flag seems to tell the title we're online.
+    info->unk08 = 1;
   } else {
     return X_E_NO_SUCH_USER;
   }
@@ -434,7 +437,7 @@ dword_result_t XamUserWriteProfileSettings_entry(
 }
 DECLARE_XAM_EXPORT1(XamUserWriteProfileSettings, kUserProfiles, kImplemented);
 
-dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
+dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t type,
                                            lpdword_t out_value) {
   // checking all users?
   if (user_index != 0xFF) {
@@ -449,6 +452,13 @@ dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
 
   // If we deny everything, games should hopefully not try to do stuff.
   *out_value = 0;
+
+  const auto& user_profile = kernel_state()->user_profile(user_index);
+  if (user_profile->signin_state() == 2) {
+    // We have enabled Live so let's allow multiplayer
+    *out_value = 1;
+  }
+
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamUserCheckPrivilege, kUserProfiles, kStub);
@@ -793,17 +803,31 @@ dword_result_t XamWriteGamerTile_entry(dword_t arg1, dword_t arg2, dword_t arg3,
 DECLARE_XAM_EXPORT1(XamWriteGamerTile, kUserProfiles, kStub);
 
 dword_result_t XamSessionCreateHandle_entry(lpdword_t handle_ptr) {
-  *handle_ptr = 0xCAFEDEAD;
+  std::random_device rd;
+  std::uniform_int_distribution<uint32_t> dist(0, 0xFFFFFFFF);
+  *handle_ptr = dist(rd);
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamSessionCreateHandle, kUserProfiles, kStub);
 
+// This is dirty, we should be creating a local xobject for sessions,
+// but I've not implemented that, so instead I pass the session handle around
+// as if it's a pointer. Fortunately all functions which use that pointer are
+// within xenia anyway, but in future this should actually be a pointer.
+// - Codie
+
+//dword_result_t XamSessionRefObjByHandle_entry(dword_t handle,
+//                                              lpdword_t obj_ptr) {
+//  assert_true(handle == 0xCAFEDEAD);
+//  // TODO(PermaNull): Implement this properly,
+//  // For the time being returning 0xDEADF00D will prevent crashing.
+//  *obj_ptr = 0xDEADF00D;
+//  return X_ERROR_SUCCESS;
+//}
+
 dword_result_t XamSessionRefObjByHandle_entry(dword_t handle,
                                               lpdword_t obj_ptr) {
-  assert_true(handle == 0xCAFEDEAD);
-  // TODO(PermaNull): Implement this properly,
-  // For the time being returning 0xDEADF00D will prevent crashing.
-  *obj_ptr = 0xDEADF00D;
+  *obj_ptr = (uint32_t)handle;
   return X_ERROR_SUCCESS;
 }
 DECLARE_XAM_EXPORT1(XamSessionRefObjByHandle, kUserProfiles, kStub);
@@ -829,6 +853,51 @@ dword_result_t XamUserGetSubscriptionType_entry(dword_t user_index, dword_t unk2
   return 0;
 }
 DECLARE_XAM_EXPORT1(XamUserGetSubscriptionType, kUserProfiles, kStub);
+
+constexpr uint8_t kStatsMaxAmount = 64;
+
+struct X_STATS_DETAILS {
+  xe::be<uint32_t> id;
+  xe::be<uint32_t> stats_amount;
+  xe::be<uint16_t> stats[kStatsMaxAmount];
+};
+static_assert_size(X_STATS_DETAILS, 8 + kStatsMaxAmount * 2);
+
+dword_result_t XamUserCreateStatsEnumerator_entry(
+    dword_t title_id, dword_t user_index, dword_t count, dword_t flags,
+    dword_t unk, pointer_t<X_STATS_DETAILS> stats_ptr,
+    lpdword_t buffer_size_ptr, lpdword_t handle_ptr) {
+  if (!count || !buffer_size_ptr || !handle_ptr || !stats_ptr) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  if (user_index >= 4) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  if (!flags || flags > 0x64) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  size_t entry_size = sizeof(X_STATS_DETAILS);
+
+  if (buffer_size_ptr) {
+    *buffer_size_ptr =
+        static_cast<uint32_t>(entry_size) * stats_ptr->stats_amount;
+  }
+
+  auto e = object_ref<XStaticUntypedEnumerator>(
+      new XStaticUntypedEnumerator(kernel_state(), count, flags));
+
+  auto result = e->Initialize(user_index, 0xFB, 0xB0023, 0xB0024, 0);
+  if (XFAILED(result)) {
+    return result;
+  }
+
+  *handle_ptr = e->handle();
+  return X_ERROR_SUCCESS;
+}
+DECLARE_XAM_EXPORT1(XamUserCreateStatsEnumerator, kUserProfiles, kSketchy);
 
 }  // namespace xam
 }  // namespace kernel
